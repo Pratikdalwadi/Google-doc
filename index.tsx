@@ -14,10 +14,6 @@ const fileNameSpan = document.getElementById('file-name');
 const extractButton = document.getElementById(
   'extract-button',
 ) as HTMLButtonElement;
-const pdfCanvas = document.getElementById('pdf-canvas') as HTMLCanvasElement;
-const imagePreview = document.getElementById(
-  'image-preview',
-) as HTMLImageElement;
 const markdownResultsContainer = document.getElementById('markdown-results');
 const jsonResultsContainer = document.getElementById('json-results');
 const loadingSpinner = document.getElementById('loading-spinner');
@@ -31,8 +27,7 @@ let fileData: {
   mimeType: string;
   data: string;
 } | null = null;
-let originalWidth: number = 0;
-let originalHeight: number = 0;
+let pageDimensions: { width: number; height: number }[] = [];
 
 // The schema is now a constant to be used for both the API call and the UI display.
 const EXTRACTION_SCHEMA = {
@@ -206,7 +201,10 @@ function setActiveTab(tabName: string) {
     // Fix: Cast 'button' to HTMLElement to access the 'dataset' property.
     // This resolves the "Property 'dataset' does not exist on type 'Element'" error,
     // as querySelectorAll returns a list of generic Elements.
-    button.classList.toggle('active', (button as HTMLElement).dataset.tab === tabName);
+    button.classList.toggle(
+      'active',
+      (button as HTMLElement).dataset.tab === tabName,
+    );
   });
   tabPanels.forEach((panel) => {
     panel.classList.toggle('active', panel.id === `${tabName}-tab`);
@@ -228,22 +226,39 @@ async function renderPreview(file: File) {
     if (file.type === 'application/pdf') {
       const pdf = await pdfjsLib.getDocument({ data: atob(base64Data) })
         .promise;
-      const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale: 1.5 });
-      const context = pdfCanvas.getContext('2d');
-      pdfCanvas.height = viewport.height;
-      pdfCanvas.width = viewport.width;
-      originalWidth = viewport.width;
-      originalHeight = viewport.height;
-      await page.render({ canvasContext: context, viewport: viewport }).promise;
-      pdfCanvas.style.display = 'block';
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const canvas = document.createElement('canvas');
+        canvas.dataset.pageNumber = String(i);
+
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 1.5 });
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        pageDimensions.push({
+          width: viewport.width,
+          height: viewport.height,
+        });
+
+        await page.render({ canvasContext: context, viewport: viewport })
+          .promise;
+        previewContainer.appendChild(canvas);
+      }
     } else {
+      const imagePreview = document.createElement('img');
       imagePreview.src = result;
-      imagePreview.style.display = 'block';
+      imagePreview.alt = 'Image preview';
+      imagePreview.dataset.pageNumber = '1';
+
       imagePreview.onload = () => {
-        originalWidth = imagePreview.naturalWidth;
-        originalHeight = imagePreview.naturalHeight;
+        pageDimensions.push({
+          width: imagePreview.naturalWidth,
+          height: imagePreview.naturalHeight,
+        });
       };
+      previewContainer.appendChild(imagePreview);
     }
   };
   reader.readAsDataURL(file);
@@ -352,7 +367,19 @@ function displayJsonResults(data: any) {
 function drawBoundingBox(element: any) {
   clearBoundingBoxes();
   const box = element.bounding_box;
-  if (!box) return;
+  if (!box || !element.page) return;
+
+  const previewElement = document.querySelector(
+    `#preview-container [data-page-number='${element.page}']`,
+  ) as HTMLElement;
+
+  if (!previewElement) return;
+
+  // Scroll the element into view
+  previewElement.scrollIntoView({
+    behavior: 'smooth',
+    block: 'nearest',
+  });
 
   const boundingBoxDiv = document.createElement('div');
   boundingBoxDiv.className = 'bounding-box';
@@ -363,14 +390,11 @@ function drawBoundingBox(element: any) {
     boundingBoxDiv.classList.add('bounding-box-text');
   }
 
-  const previewElement =
-    pdfCanvas.style.display === 'block' ? pdfCanvas : imagePreview;
-
   const displayWidth = previewElement.clientWidth;
   const displayHeight = previewElement.clientHeight;
 
-  const contentWidth = originalWidth;
-  const contentHeight = originalHeight;
+  const { width: contentWidth, height: contentHeight } =
+    pageDimensions[element.page - 1];
 
   if (!contentWidth || !contentHeight) return;
 
@@ -391,15 +415,23 @@ function drawBoundingBox(element: any) {
     offsetY = (displayHeight - scaledContentHeight) / 2;
   }
 
-  const finalX = box.x * contentWidth * scale + offsetX;
-  const finalY = box.y * contentHeight * scale + offsetY;
-  const finalWidth = box.width * contentWidth * scale;
-  const finalHeight = box.height * contentHeight * scale;
+  const boxX = box.x * contentWidth * scale + offsetX;
+  const boxY = box.y * contentHeight * scale + offsetY;
+  const boxWidth = box.width * contentWidth * scale;
+  const boxHeight = box.height * contentHeight * scale;
 
-  boundingBoxDiv.style.left = `${finalX}px`;
-  boundingBoxDiv.style.top = `${finalY}px`;
-  boundingBoxDiv.style.width = `${finalWidth}px`;
-  boundingBoxDiv.style.height = `${finalHeight}px`;
+  const containerRect = previewContainer.getBoundingClientRect();
+  const elementRect = previewElement.getBoundingClientRect();
+
+  const relativeTop =
+    elementRect.top - containerRect.top + previewContainer.scrollTop;
+  const relativeLeft =
+    elementRect.left - containerRect.left + previewContainer.scrollLeft;
+
+  boundingBoxDiv.style.left = `${relativeLeft + boxX}px`;
+  boundingBoxDiv.style.top = `${relativeTop + boxY}px`;
+  boundingBoxDiv.style.width = `${boxWidth}px`;
+  boundingBoxDiv.style.height = `${boxHeight}px`;
 
   previewContainer.appendChild(boundingBoxDiv);
 }
@@ -417,12 +449,9 @@ function clearResults() {
 }
 
 function clearPreview() {
-  const context = pdfCanvas.getContext('2d');
-  context.clearRect(0, 0, pdfCanvas.width, pdfCanvas.height);
-  pdfCanvas.style.display = 'none';
-  imagePreview.src = '#';
-  imagePreview.style.display = 'none';
+  previewContainer.innerHTML = '';
   fileData = null;
+  pageDimensions = [];
   clearBoundingBoxes();
   clearResults();
   setActiveTab('schema');
